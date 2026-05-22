@@ -123,9 +123,16 @@ const STICKMAN_PROPORTIONS = {
 };
 
 const STICKMAN_COLOR = "#1A1A1A";
-const JOINT_RADIUS = 8; // used for mouse hit detection only
-const HAND_FOOT_RADIUS = 11; // used for mouse hit detection only
 const HOVER_GLOW = "#FF6B35";
+
+// Maps getStickmanJoints() display names → bodies object keys
+const JOINT_TO_BODY: Record<string, string> = {
+  head: "head", neck: "torso", torso: "torso",
+  leftShoulder: "leftUpperArm", leftElbow: "leftLowerArm", leftHand: "leftHand",
+  rightShoulder: "rightUpperArm", rightElbow: "rightLowerArm", rightHand: "rightHand",
+  leftHip: "leftUpperLeg", leftKnee: "leftLowerLeg", leftFoot: "leftFoot",
+  rightHip: "rightUpperLeg", rightKnee: "rightLowerLeg", rightFoot: "rightFoot",
+};
 
 function drawWall(ctx, incline) {
   // Clear
@@ -261,7 +268,8 @@ function drawStickman(ctx, bodies, hoveredJoint, draggedJoint) {
     .filter(([k]) => k !== "head")
     .forEach(([joint, pos]) => {
       const isActive = hoveredJoint === joint || draggedJoint === joint;
-      const r = isActive ? 6 : 5;
+      const isLimb = ["leftHand", "rightHand", "leftFoot", "rightFoot"].includes(joint);
+      const r = isActive ? (isLimb ? 10 : 6) : (isLimb ? 8 : 5);
       ctx.save();
       if (isActive) {
         ctx.shadowColor = HOVER_GLOW;
@@ -281,25 +289,29 @@ function drawStickman(ctx, bodies, hoveredJoint, draggedJoint) {
 }
 
 export default function Home() {
-  const canvasRef = useRef(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const [incline, setIncline] = useState(75);
   const [height, setHeight] = useState(72); // inches
   const [weight, setWeight] = useState(150); // lbs
-  const [engine, setEngine] = useState(null);
-  const [bodies, setBodies] = useState(null);
+  const [engine, setEngine] = useState<Matter.Engine | null>(null);
+  const [bodies, setBodies] = useState<Record<string, Matter.Body> | null>(null);
   const [hoveredJoint, setHoveredJoint] = useState(null);
   const [draggedJoint, setDraggedJoint] = useState(null);
   const [scale, setScale] = useState(1);
   const [selectedHold, setSelectedHold] = useState("jug");
-  const [holds, setHolds] = useState([]);
+  const [holds, setHolds] = useState<Array<{x: number, y: number, type: string, assignedLimb?: string}>>([]);
   const [climberPlaced, setClimberPlaced] = useState(false);
+  const [mode, setMode] = useState("select");
+  const spawnPosRef = useRef<{x: number, y: number} | null>(null);
+  const limbConstraints = useRef<Record<string, Matter.Constraint>>({});
+  const snapHoldIndexRef = useRef<number | null>(null);
 
   // Setup Matter.js and stickman
   useEffect(() => {
     if (!canvasRef.current || !climberPlaced) return;
     // Clean up previous engine
     if (engine) {
-      Matter.Runner.stop(engine.runner);
+      Matter.Runner.stop((engine as any).runner);
       Matter.World.clear(engine.world, false);
       Matter.Engine.clear(engine);
     }
@@ -310,8 +322,8 @@ export default function Home() {
     // Stickman proportions in px
     const px = v => v * height * scalePx;
     // Center stickman
-    const cx = WALL_WIDTH / 2;
-    const cy = WALL_HEIGHT * 0.15 + px(STICKMAN_PROPORTIONS.head) / 2;
+    const cx = spawnPosRef.current ? spawnPosRef.current.x : WALL_WIDTH / 2;
+    const cy = spawnPosRef.current ? spawnPosRef.current.y : WALL_HEIGHT * 0.15 + px(STICKMAN_PROPORTIONS.head) / 2;
     // Create engine
     const _engine = Engine.create();
     // Add floor
@@ -379,7 +391,7 @@ export default function Home() {
     function render() {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const ctx = canvas.getContext("2d");
+      const ctx = canvas.getContext("2d")!;
       drawWall(ctx, incline);
       // Draw floor
       ctx.save();
@@ -388,6 +400,38 @@ export default function Home() {
       ctx.restore();
       // Draw holds
       holds.forEach(hold => drawHold(ctx, hold));
+      // Snap highlight ring
+      const snapIdx = snapHoldIndexRef.current;
+      if (snapIdx !== null && holds[snapIdx]) {
+        const h = holds[snapIdx];
+        ctx.save();
+        ctx.strokeStyle = "#FF6B35";
+        ctx.lineWidth = 4;
+        ctx.shadowColor = "#FF6B35";
+        ctx.shadowBlur = 14;
+        ctx.beginPath();
+        ctx.arc(h.x, h.y, 26, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.restore();
+      }
+      // Stuck-limb connection lines
+      if (bodies) {
+        Object.entries(limbConstraints.current).forEach(([jointName, c]) => {
+          const bk = JOINT_TO_BODY[jointName];
+          if (!bk || !bodies[bk]) return;
+          const lp = bodies[bk].position;
+          ctx.save();
+          ctx.strokeStyle = "#FF6B35";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 4]);
+          ctx.globalAlpha = 0.7;
+          ctx.beginPath();
+          ctx.moveTo(lp.x, lp.y);
+          ctx.lineTo(c.pointB.x, c.pointB.y);
+          ctx.stroke();
+          ctx.restore();
+        });
+      }
       // Draw stickman if placed
       if (climberPlaced && bodies) {
         drawStickman(ctx, bodies, hoveredJoint, draggedJoint);
@@ -397,7 +441,7 @@ export default function Home() {
         ctx.font = "600 1.2rem Inter, Arial, sans-serif";
         ctx.fillStyle = "#B0AFA8";
         ctx.textAlign = "center";
-        ctx.fillText("Click 'Place Climber' to add the stickman", WALL_WIDTH / 2, WALL_HEIGHT / 2);
+        ctx.fillText("Drag the climber from the sidebar onto the wall", WALL_WIDTH / 2, WALL_HEIGHT / 2);
         ctx.restore();
       }
       animationId = requestAnimationFrame(render);
@@ -412,13 +456,19 @@ export default function Home() {
     const canvas = canvasRef.current;
     function getJointAt(x, y) {
       if (!bodies) return null;
-      const joints = getStickmanJoints(bodies);
-      for (const [joint, pos] of Object.entries(joints)) {
-        let r = JOINT_RADIUS * scale;
-        if (["leftHand", "rightHand", "leftFoot", "rightFoot"].includes(joint)) r = HAND_FOOT_RADIUS * scale;
-        const dx = x - pos.x;
-        const dy = y - pos.y;
-        if (dx * dx + dy * dy < r * r * 1.2) return joint;
+      const joints = getStickmanJoints(bodies) as Record<string, {x: number, y: number}>;
+      const groups = [
+        { keys: ["leftHand", "rightHand", "leftFoot", "rightFoot"], r: 25 },
+        { keys: ["head", "neck", "torso"], r: 15 },
+        { keys: ["leftShoulder", "leftElbow", "rightShoulder", "rightElbow", "leftHip", "leftKnee", "rightHip", "rightKnee"], r: 12 },
+      ];
+      for (const { keys, r } of groups) {
+        for (const joint of keys) {
+          const pos = joints[joint];
+          if (!pos) continue;
+          const dx = x - pos.x, dy = y - pos.y;
+          if (dx * dx + dy * dy < r * r * scale * scale) return joint;
+        }
       }
       return null;
     }
@@ -431,17 +481,27 @@ export default function Home() {
       return null;
     }
     let dragging = false;
-    let dragJoint = null;
+    let dragJoint: string | null = null;
     let offset = { x: 0, y: 0 };
     function onMouseMove(e) {
       const rect = canvas.getBoundingClientRect();
       const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
       const y = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
       if (dragging && dragJoint && climberPlaced) {
-        // Move joint body
-        const body = bodies[dragJoint];
-        Body.setPosition(body, { x: x - offset.x, y: y - offset.y });
+        const bodyKey = JOINT_TO_BODY[dragJoint];
+        if (!bodyKey || !bodies || !bodies[bodyKey]) return;
+        Body.setPosition(bodies[bodyKey], { x: x - offset.x, y: y - offset.y });
+        if (["leftHand", "rightHand", "leftFoot", "rightFoot"].includes(dragJoint)) {
+          const lp = bodies[bodyKey].position;
+          let bestIdx = null, bestDist = 40;
+          holds.forEach((hold, idx) => {
+            const d = Math.hypot(lp.x - hold.x, lp.y - hold.y);
+            if (d < bestDist) { bestDist = d; bestIdx = idx; }
+          });
+          snapHoldIndexRef.current = bestIdx;
+        }
       } else if (climberPlaced) {
+        snapHoldIndexRef.current = null;
         setHoveredJoint(getJointAt(x, y));
       }
     }
@@ -457,27 +517,58 @@ export default function Home() {
           return;
         }
       }
-      // Place hold if a hold type is selected and not clicking a joint
-      if (selectedHold && (!climberPlaced || !getJointAt(x, y)) && e.button === 0) {
-        // Snap to nearest grid dot
+      // Place hold only in place mode
+      if (mode === "place" && selectedHold && e.button === 0) {
         const gx = Math.round((x - HOLE_SPACING / 2) / HOLE_SPACING) * HOLE_SPACING + HOLE_SPACING / 2;
         const gy = Math.round((y - HOLE_SPACING / 2) / HOLE_SPACING) * HOLE_SPACING + HOLE_SPACING / 2;
         setHolds(hs => [...hs, { x: gx, y: gy, type: selectedHold }]);
         return;
       }
       // Drag joint
-      if (climberPlaced) {
+      if (climberPlaced && bodies) {
         const joint = getJointAt(x, y);
         if (joint) {
+          const bodyKey = JOINT_TO_BODY[joint];
+          if (!bodyKey || !bodies[bodyKey]) return;
+          // Release existing limb constraint before dragging
+          if (limbConstraints.current[joint] && engine) {
+            World.remove(engine.world, limbConstraints.current[joint]);
+            delete limbConstraints.current[joint];
+            setHolds(hs => hs.map(h => h.assignedLimb === joint ? { ...h, assignedLimb: undefined } : h));
+          }
           dragging = true;
           dragJoint = joint;
           setDraggedJoint(joint);
-          const pos = bodies[joint].position;
+          Body.setStatic(bodies[bodyKey], true);
+          const pos = bodies[bodyKey].position;
           offset = { x: x - pos.x, y: y - pos.y };
         }
       }
     }
     function onMouseUp() {
+      if (dragging && dragJoint && bodies && engine) {
+        const bodyKey = JOINT_TO_BODY[dragJoint];
+        if (bodyKey && bodies[bodyKey]) {
+          const limbBody = bodies[bodyKey];
+          Body.setStatic(limbBody, false);
+          if (["leftHand", "rightHand", "leftFoot", "rightFoot"].includes(dragJoint)) {
+            let bestIdx = -1, bestDist = 40;
+            holds.forEach((hold, idx) => {
+              const d = Math.hypot(limbBody.position.x - hold.x, limbBody.position.y - hold.y);
+              if (d < bestDist) { bestDist = d; bestIdx = idx; }
+            });
+            if (bestIdx >= 0) {
+              const hold = holds[bestIdx];
+              Body.setPosition(limbBody, { x: hold.x, y: hold.y });
+              const c = Constraint.create({ bodyA: limbBody, pointB: { x: hold.x, y: hold.y }, length: 0, stiffness: 1.0, damping: 0.1 });
+              World.add(engine.world, c);
+              limbConstraints.current[dragJoint] = c;
+              setHolds(hs => hs.map((h, i) => i === bestIdx ? { ...h, assignedLimb: dragJoint! } : h));
+            }
+          }
+        }
+      }
+      snapHoldIndexRef.current = null;
       dragging = false;
       dragJoint = null;
       setDraggedJoint(null);
@@ -503,7 +594,7 @@ export default function Home() {
       canvas.removeEventListener("touchend", onMouseUp);
       canvas.removeEventListener("contextmenu", onContextMenu);
     };
-  }, [bodies, scale, selectedHold, holds, climberPlaced]);
+  }, [bodies, scale, selectedHold, holds, climberPlaced, mode, engine]);
 
   function formatHeight(inches) {
     const ft = Math.floor(inches / 12);
@@ -515,9 +606,25 @@ export default function Home() {
     <div className="flex h-[100vh] w-full bg-[#F8F8F8] font-sans text-[#171717] select-none">
       {/* Left Sidebar */}
       <aside className="w-[280px] h-full bg-white border-r border-[#E5E7EB] flex flex-col px-6 py-8">
-        <div className="mb-8">
+        <div className="mb-6">
           <h1 className="font-bold text-2xl tracking-tight text-[#171717]">CruxMan</h1>
           <div className="text-xs text-gray-500 font-medium mt-1">Climbing Force Analyzer</div>
+        </div>
+        {/* Mode Toggle */}
+        <div className="mb-6">
+          <div className="uppercase text-[11px] tracking-widest text-gray-400 font-semibold mb-2">Mode</div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              className={"flex-1 py-1.5 text-xs font-semibold rounded transition " + (mode === "select" ? "bg-[#FF6B35] text-white" : "bg-white text-[#171717] border border-gray-300 hover:border-[#FF6B35]")}
+              onClick={() => setMode("select")}
+            >Select</button>
+            <button
+              type="button"
+              className={"flex-1 py-1.5 text-xs font-semibold rounded transition " + (mode === "place" ? "bg-[#FF6B35] text-white" : "bg-white text-[#171717] border border-gray-300 hover:border-[#FF6B35]")}
+              onClick={() => setMode("place")}
+            >Place Hold</button>
+          </div>
         </div>
         <div className="mb-6">
           <div className="uppercase text-[11px] tracking-widest text-gray-400 font-semibold mb-2">Wall Incline</div>
@@ -613,19 +720,42 @@ export default function Home() {
             ))}
           </div>
         </div>
+        {/* Draggable stickman */}
+        <div className="mb-4">
+          <div className="uppercase text-[11px] tracking-widest text-gray-400 font-semibold mb-2">Climber</div>
+          <div
+            draggable={!climberPlaced}
+            onDragStart={e => e.dataTransfer.setData("text/plain", "stickman")}
+            title={climberPlaced ? "Climber already on wall" : "Drag onto wall"}
+            className={"inline-flex flex-col items-center gap-1 " + (climberPlaced ? "opacity-40 cursor-not-allowed" : "cursor-grab hover:opacity-70")}
+          >
+            <svg width="44" height="62" viewBox="0 0 44 62">
+              <circle cx="22" cy="9" r="8" fill="#1A1A1A"/>
+              <line x1="22" y1="17" x2="22" y2="38" stroke="#1A1A1A" strokeWidth="3" strokeLinecap="round"/>
+              <line x1="8" y1="25" x2="36" y2="25" stroke="#1A1A1A" strokeWidth="3" strokeLinecap="round"/>
+              <line x1="22" y1="38" x2="10" y2="56" stroke="#1A1A1A" strokeWidth="3" strokeLinecap="round"/>
+              <line x1="22" y1="38" x2="34" y2="56" stroke="#1A1A1A" strokeWidth="3" strokeLinecap="round"/>
+            </svg>
+            <span className="text-[10px] text-gray-400">drag to wall</span>
+          </div>
+        </div>
         <div className="flex-1" />
-        <button
-          className="w-full py-2 mt-2 bg-[#FF6B35] text-white font-bold rounded shadow hover:bg-[#ff874f] transition"
-          onClick={() => setClimberPlaced(true)}
-          disabled={climberPlaced}
-        >
-          Place Climber
-        </button>
       </aside>
 
       {/* Main Wall Area */}
       <main className="flex-1 flex items-center justify-center relative h-full">
-        <div className="relative" style={{ width: WALL_WIDTH, height: WALL_HEIGHT }}>
+        <div
+            className="relative"
+            style={{ width: WALL_WIDTH, height: WALL_HEIGHT }}
+            onDragOver={e => e.preventDefault()}
+            onDrop={e => {
+              e.preventDefault();
+              if (climberPlaced) return;
+              const rect = canvasRef.current!.getBoundingClientRect();
+              spawnPosRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+              setClimberPlaced(true);
+            }}
+          >
           {/* Wall shadow */}
           <div
             className="absolute inset-0 pointer-events-none"
@@ -640,7 +770,7 @@ export default function Home() {
             width={WALL_WIDTH}
             height={WALL_HEIGHT}
             className="block w-full h-full rounded"
-            style={{ background: WALL_BG, borderRadius: 8, cursor: selectedHold ? "crosshair" : "default" }}
+            style={{ background: WALL_BG, borderRadius: 8, cursor: mode === "place" ? "crosshair" : "default" }}
           />
         </div>
       </main>
